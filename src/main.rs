@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use spotify2tidal::{Config, PlaylistMigrator, SpotifyClient};
+use spotify2tidal::{Config, PlaylistMigrator, PublicSpotifyClient, SpotifyClient};
 
 #[derive(Parser)]
 #[command(name = "spotify2tidal")]
@@ -57,6 +57,28 @@ enum Commands {
     /// List all your Spotify playlists
     ListPlaylists,
 
+    /// Import a public Spotify playlist by URL
+    ImportUrl {
+        /// Spotify playlist URL (e.g., https://open.spotify.com/playlist/...)
+        url: String,
+
+        /// Name for the Tidal playlist (defaults to original name)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Preview migration without creating playlist
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Tidal client ID (or set TIDAL_CLIENT_ID env var)
+        #[arg(long, env = "TIDAL_CLIENT_ID")]
+        tidal_client_id: String,
+
+        /// Tidal client secret (or set TIDAL_CLIENT_SECRET env var)
+        #[arg(long, env = "TIDAL_CLIENT_SECRET")]
+        tidal_client_secret: String,
+    },
+
     /// Show setup guide
     Setup,
 }
@@ -99,6 +121,16 @@ async fn main() -> Result<()> {
         }
         Commands::ListPlaylists => {
             list_playlists().await?;
+        }
+        Commands::ImportUrl {
+            url,
+            name,
+            dry_run,
+            tidal_client_id,
+            tidal_client_secret,
+        } => {
+            import_url(&url, name.as_deref(), dry_run, &tidal_client_id, &tidal_client_secret)
+                .await?;
         }
         Commands::Setup => {
             show_setup_guide();
@@ -265,6 +297,158 @@ fn show_setup_guide() {
     println!("   - spotify2tidal migrate-all --dry-run   (to test migration)");
     println!("   - spotify2tidal migrate-all             (to perform migration)");
     println!("   - spotify2tidal migrate \"Playlist Name\" (to migrate specific playlist)");
+    println!("   - spotify2tidal import-url <URL>        (to import a public playlist)");
 
     println!("\n{}", "Ready to start migrating!".green());
+}
+
+async fn import_url(
+    url: &str,
+    custom_name: Option<&str>,
+    dry_run: bool,
+    tidal_client_id: &str,
+    tidal_client_secret: &str,
+) -> Result<()> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use spotify2tidal::TidalClient;
+
+    println!("{}", "Import Spotify Playlist by URL".cyan().bold());
+    println!("{}", "=".repeat(50));
+
+    if dry_run {
+        println!(
+            "{}",
+            "DRY RUN MODE - No playlist will be created".yellow()
+        );
+    }
+
+    let config = Config::from_env().context("Failed to load configuration")?;
+
+    if !config.validate_spotify_config() {
+        println!("{}", "Missing Spotify configuration".red());
+        println!("Required: SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET");
+        std::process::exit(1);
+    }
+
+    // Parse the playlist ID from URL
+    let playlist_id = PublicSpotifyClient::parse_playlist_url(url)
+        .context("Failed to parse Spotify URL")?;
+
+    println!("Playlist ID: {}", playlist_id.cyan());
+
+    // Fetch the playlist using client credentials (no user auth needed)
+    let spotify_client = PublicSpotifyClient::new(&config)
+        .await
+        .context("Failed to connect to Spotify")?;
+
+    let playlist = spotify_client
+        .get_playlist(&playlist_id)
+        .await
+        .context("Failed to fetch playlist")?;
+
+    let playlist_name = custom_name.unwrap_or(&playlist.name);
+
+    println!(
+        "\nPlaylist: {} ({} tracks)",
+        playlist_name.green(),
+        playlist.tracks.len()
+    );
+    println!("Owner: {}", playlist.owner.cyan());
+    if !playlist.description.is_empty() {
+        println!("Description: {}", playlist.description);
+    }
+
+    // Connect to Tidal
+    let tidal_client = TidalClient::new(tidal_client_id, tidal_client_secret)
+        .await
+        .context("Failed to connect to Tidal")?;
+
+    // Match tracks
+    println!("\n{}", "Matching tracks...".cyan());
+
+    let pb = ProgressBar::new(playlist.tracks.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    let mut matched_tracks = Vec::new();
+    let mut failed_tracks = Vec::new();
+
+    for track in &playlist.tracks {
+        pb.set_message(format!("{}", track.name));
+        match tidal_client.search_track(track).await {
+            Some(tidal_track) => {
+                matched_tracks.push(tidal_track);
+            }
+            None => {
+                failed_tracks.push(track);
+            }
+        }
+        pb.inc(1);
+    }
+
+    pb.finish_and_clear();
+
+    // Print summary
+    let success_rate = (matched_tracks.len() as f64 / playlist.tracks.len() as f64) * 100.0;
+
+    println!("\n{}", "=".repeat(50));
+    println!("{}", "MATCHING RESULTS".bold());
+    println!("{}", "=".repeat(50));
+    println!(
+        "Matched: {} / {} ({:.1}%)",
+        matched_tracks.len().to_string().green(),
+        playlist.tracks.len(),
+        success_rate
+    );
+    println!("Failed: {}", failed_tracks.len().to_string().red());
+
+    if !failed_tracks.is_empty() {
+        println!("\n{}", "Failed to match:".yellow());
+        for track in &failed_tracks {
+            println!(
+                "  - {} by {}",
+                track.name,
+                track.artists.join(", ")
+            );
+        }
+    }
+
+    // Create Tidal playlist if not dry run
+    if !dry_run && !matched_tracks.is_empty() {
+        println!("\n{}", "Creating Tidal playlist...".cyan());
+
+        let description = format!("Imported from Spotify. {}", playlist.description);
+        let tidal_playlist = tidal_client
+            .create_playlist(playlist_name, &description)
+            .await
+            .context("Failed to create Tidal playlist")?;
+
+        // Add tracks in batches
+        let track_ids: Vec<u64> = matched_tracks.iter().map(|t| t.id).collect();
+        let batch_size = 100;
+
+        for chunk in track_ids.chunks(batch_size) {
+            tidal_client
+                .add_tracks_to_playlist(&tidal_playlist.id, chunk)
+                .await
+                .context("Failed to add tracks to playlist")?;
+        }
+
+        println!(
+            "\n{} Created playlist '{}' with {} tracks",
+            "SUCCESS!".green().bold(),
+            playlist_name,
+            matched_tracks.len()
+        );
+    } else if dry_run {
+        println!("\n{}", "Dry run completed - no playlist created".yellow());
+    } else {
+        println!("\n{}", "No tracks matched - playlist not created".red());
+    }
+
+    Ok(())
 }

@@ -4,6 +4,7 @@ A command-line tool to migrate your Spotify playlists to Tidal, written in Rust.
 
 ## Features
 
+- **Import public playlists by URL** - No Spotify login required!
 - Migrate all or specific playlists from Spotify to Tidal
 - Three-tier track matching algorithm:
   1. **ISRC matching** - Exact identification using International Standard Recording Code
@@ -61,7 +62,16 @@ TIDAL_CLIENT_SECRET=your_tidal_client_secret
 # Show setup guide
 spotify2tidal setup
 
-# List all your Spotify playlists
+# Import a public Spotify playlist by URL (no Spotify login needed!)
+spotify2tidal import-url "https://open.spotify.com/playlist/37i9dQZF1E8NC99vGqLsaH"
+
+# Import with a custom name
+spotify2tidal import-url "https://open.spotify.com/playlist/..." --name "My New Playlist"
+
+# Preview import without creating playlist
+spotify2tidal import-url "https://open.spotify.com/playlist/..." --dry-run
+
+# List all your Spotify playlists (requires Spotify login)
 spotify2tidal list-playlists
 
 # Migrate all playlists (dry run - no changes made)
